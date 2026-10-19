@@ -19,6 +19,7 @@ to cycle through a series of related links to build up all 1000 records.
 """
 
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,16 @@ HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 URL = "https://api.github.com/repos/git/git/commits"
 PER_PAGE = 100
 PAGES = 10
+
+# write logs to a local file alongside this script. A handler is attached
+# directly to our logger because prefect configures the root logger on import,
+# which makes logging.basicConfig() a silent no-op.
+log = logging.getLogger("gh_pagination")
+log.setLevel(logging.INFO)
+log.propagate = False  # file only; print() already covers the console/Prefect UI
+_fh = logging.FileHandler(Path(__file__).with_name("07_github_api_pagination.log"))
+_fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+log.addHandler(_fh)
 
 
 # ------ only one task ------
@@ -67,14 +78,83 @@ def ingest_data():
     # if you need to see a working example of this, see this file in this repo
     # 04_apis/05_pagination.py
 
-    # just a placeholder for now. remove the print below this is built out
-    print("something")
+    try:
+        # (re)create the target table so each run yields exactly PAGES * PER_PAGE rows
+        conn.execute("""
+            CREATE OR REPLACE TABLE commits (
+                sha          VARCHAR PRIMARY KEY,
+                author_name  VARCHAR,
+                author_date  TIMESTAMPTZ,
+                message      VARCHAR,
+                html_url     VARCHAR,
+                page         INTEGER,
+                ingested_at  TIMESTAMPTZ
+            )
+        """)
+        log.info("created table commits")
+
+        # starting state: first URL + query params, page counter
+        url = URL
+        params = {"per_page": PER_PAGE}
+        page = 1
+
+        # follow GitHub's "next" links until we hit PAGES or run out of pages
+        while url and page <= PAGES:
+            # fetch one page of commits; fail loudly on non-2xx so prefect can retry
+            response = httpx.get(url, headers=HEADERS, params=params, timeout=30)
+            response.raise_for_status()
+            commits = response.json()
+            print(f"page {page}: {len(commits)} commits")
+            log.info(f"page {page}: {len(commits)} commits")
+
+            # flatten each nested commit dict into a tuple matching the table's column order
+            now = datetime.now(timezone.utc)
+            rows = [
+                (
+                    c["sha"],
+                    c["commit"]["author"]["name"],
+                    c["commit"]["author"]["date"],
+                    c["commit"]["message"],
+                    c["html_url"],
+                    page,
+                    now,
+                )
+                for c in commits
+            ]
+
+            # bulk insert this page's rows; ? placeholders are filled positionally from each tuple
+            conn.executemany("INSERT INTO commits VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+
+            # advance: next URL from the Link header (None on last page); it already
+            # carries per_page & page, so drop params after the first request
+            url = response.links.get("next", {}).get("url")
+            params = None
+            page += 1
+
+        # sanity check: report how many rows landed
+        total = conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0]
+        print(f"loaded {total} commits into commits table")
+        log.info(f"loaded {total} commits into commits table")
+        return total
+
+    except httpx.HTTPStatusError as e:
+        # non-2xx from GitHub (bad token, rate limit, etc.) -- log the status and body
+        log.error(f"HTTP {e.response.status_code} from {e.request.url}: {e.response.text[:200]}")
+        raise
+    except Exception:
+        # anything else (network, JSON, DuckDB) -- log full traceback
+        log.exception("ingest failed")
+        raise
 
 
 # name the flow something you can identify as yourself
-@flow(name="nem2p-flow")
+@flow(name="bpy2nc-flow")
 def main_flow():
     ingest_data()
 
 # it doesn't seem this flow executes when you run it. Why?
 # fix it ;^)
+# -> the flow was defined but never called. This guard runs it when the
+#    script is executed directly (not when it's imported by another module).
+if __name__ == "__main__":
+    main_flow()
